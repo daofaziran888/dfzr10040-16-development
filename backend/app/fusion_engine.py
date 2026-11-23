@@ -416,10 +416,19 @@ class FusionEngine:
         quality_result = self._apply_quality_gates(
             conflict_result.get("resolved", mapped_records),
             job.target_wide_table,
+            arbitration=conflict_result,
         )
         result["quality_gate"] = quality_result
 
-        if quality_result.get("passed", True):
+        window_pending = conflict_result.get("window_confirmation_required", False)
+        if window_pending:
+            result["window_confirmation_required"] = True
+            result["held_candidates"] = (
+                conflict_result.get("pending_candidates", [])
+                + conflict_result.get("excluded_candidates", [])
+            )
+
+        if quality_result.get("passed", True) and not window_pending:
             snap = self.create_snapshot(
                 job.target_wide_table,
                 partition_key_value=datetime.now(timezone.utc).strftime("%Y%m%d"),
@@ -428,6 +437,181 @@ class FusionEngine:
             result["snapshot"] = {"partition_code": snap.partition_code, "record_count": snap.record_count}
 
         return result
+
+    def submit_windowed_batch(self, job_id: int,
+                              candidates: list[dict[str, Any]],
+                              window_cutoff: str | None = None) -> dict[str, Any]:
+        """按窗口截止点校验事件时间并提交质量门禁判定发布资格。
+
+        候选记录约定：
+          - ``_fusion_key`` 或作业的关联键字段：融合键；
+          - ``_event_time``：源事件时间，缺失/无法解析记为「待核」；
+          - ``_arrival_time``：到达时间，仅作证据，不能替代源事件时间。
+
+        窗口截止点取生效中 windowed_event_time 冲突规则的时间基准，
+        可由 ``window_cutoff`` 显式覆盖。事件时间待核的候选会让门禁
+        请求确认当前窗口（本批次不放行）；超窗候选不进入本次确认。
+        """
+        job = self._fusion_jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
+
+        rule = next(
+            (r for r in self._conflict_rules.values()
+             if r.target_wide_table == job.target_wide_table
+             and r.arbitration_strategy == "windowed_event_time"
+             and r.rule_status == "生效中"),
+            None,
+        )
+        cutoff = window_cutoff or (rule.time_baseline if rule else "")
+        if not cutoff:
+            return {"ok": False, "message": "缺少窗口截止点：请为冲突规则设置时间基准或显式传入"}
+
+        normalized: list[dict[str, Any]] = []
+        for rec in candidates:
+            row = dict(rec)
+            if not row.get("_fusion_key"):
+                row["_fusion_key"] = str(row.get(job.join_key, ""))
+            normalized.append(row)
+
+        if rule is None:
+            # 无生效规则时构造临时规则完成窗口校验，保证提交路径行为一致。
+            rule = MergeConflictRule(
+                rule_id=0, rule_code="MERG-EPHEMERAL",
+                target_wide_table=job.target_wide_table,
+                conflict_fields=[], arbitration_strategy="windowed_event_time",
+                priority_source="", time_baseline=cutoff,
+            )
+        arbitration = rule.resolve_windowed(normalized, cutoff=cutoff)
+
+        confirmed_rows = arbitration["resolved"]
+        gate_result = self._apply_quality_gates(
+            confirmed_rows, job.target_wide_table, arbitration=arbitration,
+        )
+
+        confirmation_required = arbitration["window_confirmation_required"]
+        release_eligible = gate_result["passed"] and not confirmation_required
+
+        job.pending_batch = normalized
+        job.last_window_cutoff = cutoff
+        job.held_candidates = (
+            arbitration["pending_candidates"] + arbitration["excluded_candidates"]
+        )
+
+        result: dict[str, Any] = {
+            "ok": True,
+            "job_code": job.job_code,
+            "window_cutoff": cutoff,
+            "total_candidates": len(normalized),
+            "confirmed_rows": len(confirmed_rows),
+            "window_confirmation_required": confirmation_required,
+            "release_eligible": release_eligible,
+            "arbitration": arbitration,
+            "quality_gate": gate_result,
+        }
+
+        if release_eligible:
+            by_key = {str(r.get("_fusion_key", "")): r for r in job.released_records}
+            for row in confirmed_rows:
+                by_key[str(row.get("_fusion_key", ""))] = row
+            job.released_records = list(by_key.values())
+            job.merged_records = list(job.released_records)
+            job.output_rows = len(job.released_records)
+            # 放行后仍保留超窗候选证据：它们不属于当前窗口。
+            job.held_candidates = list(arbitration["excluded_candidates"])
+            snap = self.create_snapshot(
+                job.target_wide_table,
+                partition_key_value=datetime.now(timezone.utc).strftime("%Y%m%d"),
+            )
+            snap.status_mark = "可用"
+            snap.record_count = len(confirmed_rows)
+            result["snapshot"] = {
+                "partition_code": snap.partition_code,
+                "record_count": snap.record_count,
+                "status": snap.status_mark,
+            }
+            result["gate_status"] = "已放行"
+        else:
+            result["gate_status"] = (
+                "请求确认当前窗口" if confirmation_required else "门禁未通过"
+            )
+            result["held_candidates"] = job.held_candidates
+
+        return result
+
+    def supplement_event_time(self, job_id: int, fusion_key: str,
+                              event_time: str,
+                              source: str | None = None) -> dict[str, Any]:
+        """为待核候选补充源事件时间并重新提交当前批次。
+
+        只更新仍处于「待核」（无事件时间）的候选；补充后按原窗口截止点
+        重新仲裁并重新判定发布资格。
+        """
+        job = self._fusion_jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
+        if not job.pending_batch:
+            return {"ok": False, "message": "当前没有待确认的批次"}
+
+        updated = False
+        for rec in job.pending_batch:
+            if str(rec.get("_fusion_key", "")) != str(fusion_key):
+                continue
+            if source is not None and rec.get("_source") != source:
+                continue
+            if not rec.get("_event_time"):
+                rec["_event_time"] = event_time
+                updated = True
+        if not updated:
+            return {"ok": False, "message": f"未找到待核候选：{fusion_key}"}
+
+        result = self.submit_windowed_batch(
+            job_id, job.pending_batch,
+            window_cutoff=job.last_window_cutoff or None,
+        )
+        result["supplemented"] = {"fusion_key": fusion_key, "event_time": event_time}
+        return result
+
+    def inspect_release_status(self, job_id: int,
+                               fusion_key: str | None = None) -> dict[str, Any]:
+        """查看当前可读快照（已放行行）与未能放行的候选。
+
+        可读快照内容是最近一次放行后的胜出行；未放行候选保留各自的
+        原事件时间、到达时间与窗口判定，供确认当前窗口时核对。
+        """
+        job = self._fusion_jobs.get(job_id)
+        if job is None:
+            return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
+
+        readable = list(job.released_records)
+        if fusion_key is not None:
+            readable = [
+                r for r in readable
+                if str(r.get("_fusion_key", "")) == str(fusion_key)
+                or str(r.get(job.join_key, "")) == str(fusion_key)
+            ]
+
+        available_snaps = [
+            s for s in self._snapshots.values()
+            if s.target_wide_table == job.target_wide_table and s.status_mark == "可用"
+        ]
+        latest_snap = available_snaps[-1] if available_snaps else None
+
+        return {
+            "ok": True,
+            "job_code": job.job_code,
+            "window_cutoff": job.last_window_cutoff,
+            "readable_snapshot": (
+                {"partition_code": latest_snap.partition_code,
+                 "record_count": latest_snap.record_count}
+                if latest_snap else None
+            ),
+            "readable_records": readable,
+            "held_candidates": job.held_candidates,
+            "release_eligible": not any(
+                c.get("window_status") == "待核" for c in job.held_candidates
+            ),
+        }
 
     def execute_delta_merge(self, job_id: int, delta_records: list[dict[str, Any]],
                             watermark_record_id: int = 0) -> dict[str, Any]:
@@ -799,7 +983,11 @@ class FusionEngine:
 
     def _apply_conflict_resolution(self, records: list[dict[str, Any]],
                                    target_wide_table: str) -> dict[str, Any]:
-        """应用冲突仲裁规则到融合记录。"""
+        """应用冲突仲裁规则到融合记录。
+
+        窗口化规则（windowed_event_time）额外产出仲裁时间证据：
+        每个候选的原事件时间、窗口判定与实际胜出字段，供质量门禁判定发布资格。
+        """
         rules = [
             r for r in self._conflict_rules.values()
             if r.target_wide_table == target_wide_table and r.rule_status == "生效中"
@@ -809,8 +997,26 @@ class FusionEngine:
 
         resolved = list(records)
         all_conflicts: list[dict[str, Any]] = []
+        arbitration_evidence: list[dict[str, Any]] = []
+        pending_candidates: list[dict[str, Any]] = []
+        excluded_candidates: list[dict[str, Any]] = []
+        window_confirmation_required = False
+        window_cutoff = ""
+
         for rule in rules:
-            resolved, conflicts = rule.resolve(resolved)
+            if rule.arbitration_strategy == "windowed_event_time":
+                windowed = rule.resolve_windowed(resolved)
+                resolved = windowed["resolved"]
+                conflicts = windowed["conflicts"]
+                arbitration_evidence.extend(windowed["evidence"])
+                pending_candidates.extend(windowed["pending_candidates"])
+                excluded_candidates.extend(windowed["excluded_candidates"])
+                window_confirmation_required = (
+                    window_confirmation_required or windowed["window_confirmation_required"]
+                )
+                window_cutoff = windowed["window_cutoff"] or window_cutoff
+            else:
+                resolved, conflicts = rule.resolve(resolved)
             rule.conflict_count = len(conflicts)
             all_conflicts.extend(conflicts)
 
@@ -820,11 +1026,22 @@ class FusionEngine:
             "conflicts_found": len(all_conflicts),
             "conflicts": all_conflicts[:50],
             "resolved": resolved,
+            "arbitration_evidence": arbitration_evidence,
+            "pending_candidates": pending_candidates,
+            "excluded_candidates": excluded_candidates,
+            "window_confirmation_required": window_confirmation_required,
+            "window_cutoff": window_cutoff,
         }
 
     def _apply_quality_gates(self, records: list[dict[str, Any]],
-                             target_wide_table: str) -> dict[str, Any]:
-        """应用质量门禁检查。"""
+                             target_wide_table: str,
+                             arbitration: dict[str, Any] | None = None) -> dict[str, Any]:
+        """应用质量门禁检查。
+
+        ``records`` 必须是确认为可用的那批行（窗口化仲裁的胜出行）；
+        ``arbitration`` 携带仲裁时间证据，window_confirmation 类门禁据此
+        判定当前发布资格：存在事件时间待核的候选时请求确认当前窗口。
+        """
         gates = [
             g for g in self._quality_gates.values()
             if g.target_wide_table == target_wide_table
@@ -846,9 +1063,33 @@ class FusionEngine:
                 if null_count > 0:
                     violations.append({"rule_code": gate.rule_code, "check": "null_check",
                                        "null_count": null_count})
+            elif gate.check_type == "window_confirmation":
+                evidence = arbitration or {}
+                pending = evidence.get("pending_candidates", [])
+                if pending:
+                    gate.last_triggered = _now_iso()
+                    violations.append({
+                        "rule_code": gate.rule_code,
+                        "check": "window_confirmation",
+                        "message": "事件时间证据冲突，请求确认当前窗口",
+                        "window_cutoff": evidence.get("window_cutoff", ""),
+                        "pending_candidates": pending,
+                    })
 
         passed = len(violations) == 0
-        return {"passed": passed, "gates_checked": len(gates), "violations": violations}
+        result: dict[str, Any] = {
+            "passed": passed,
+            "gates_checked": len(gates),
+            "violations": violations,
+        }
+        if arbitration:
+            result["release_evidence"] = {
+                "window_cutoff": arbitration.get("window_cutoff", ""),
+                "confirmed_rows": len(records),
+                "pending_candidates": len(arbitration.get("pending_candidates", [])),
+                "excluded_candidates": len(arbitration.get("excluded_candidates", [])),
+            }
+        return result
 
     @staticmethod
     def _make_merge_key(record: dict[str, Any], join_key: str) -> str:
